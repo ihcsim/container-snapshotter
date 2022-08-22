@@ -7,24 +7,30 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
+	"github.com/containerd/containerd/images/archive"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 )
 
 const (
 	endpoint  = "/run/containerd/containerd.sock"
+	imageName = "docker.io/library/nginx:latest"
 	namespace = "example"
+)
+
+var (
+	client *containerd.Client
 )
 
 func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Kill, os.Interrupt)
 
-	client, err := containerd.New(endpoint)
-	if err != nil {
+	if err := initClients(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -37,12 +43,17 @@ func main() {
 		client.Close()
 	}()
 
-	container, wait, err := startNginx(ctx, client)
+	container, wait, err := start(ctx, client)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := snapshot(ctx, client, container); err != nil {
+	archiveFile, err := snapshots(ctx, client, container)
+	if err != nil {
+		log.Print(err)
+	}
+
+	if _, _, err := restore(ctx, archiveFile); err != nil {
 		log.Print(err)
 	}
 
@@ -63,8 +74,17 @@ func main() {
 	}
 }
 
-func startNginx(ctx context.Context, client *containerd.Client) (containerd.Container, <-chan containerd.ExitStatus, error) {
-	image, err := client.Pull(ctx, "docker.io/library/nginx:latest", containerd.WithPullUnpack)
+func initClients() error {
+	c, err := containerd.New(endpoint)
+	if err != nil {
+		return err
+	}
+	client = c
+	return nil
+}
+
+func start(ctx context.Context, client *containerd.Client) (containerd.Container, <-chan containerd.ExitStatus, error) {
+	image, err := client.Pull(ctx, imageName, containerd.WithPullUnpack)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -97,24 +117,87 @@ func startNginx(ctx context.Context, client *containerd.Client) (containerd.Cont
 	return container, wait, nil
 }
 
-func snapshot(ctx context.Context, client *containerd.Client, container containerd.Container) error {
-	containerImg, err := container.Checkpoint(ctx, "snapshot-checkpoint")
-	if err != nil {
-		return err
-	}
-	log.Printf("snapshot: %s", containerImg.Name())
+func snapshots(ctx context.Context, client *containerd.Client, container containerd.Container) (*os.File, error) {
+	var (
+		now          = time.Now().Format("01-02-2006-15:04:05")
+		snapshotName = fmt.Sprintf("isim.dev/checkpoint/container/%s:%s", container.ID(), now)
+	)
 
-	task, err := container.Task(ctx, nil)
+	containerImg, err := container.Checkpoint(
+		ctx,
+		snapshotName,
+		containerd.WithCheckpointRuntime,
+		containerd.WithCheckpointTask)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	taskImg, err := task.Checkpoint(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to checkpoint task %s: %w", task.ID(), err)
-	}
-	log.Printf("snapshot: %s", taskImg.Name())
+	log.Printf("created container snapshot: %s", containerImg.Name())
 
-	return nil
+	return export(ctx, containerImg)
+}
+
+func export(ctx context.Context, image containerd.Image) (*os.File, error) {
+	createdAt := image.Metadata().CreatedAt.Format("01-02-2006-15:04:05")
+	archiveFile, err := os.Create(fmt.Sprintf("snapshot-%s.tar", createdAt))
+	if err != nil {
+		return nil, err
+	}
+
+	if err := client.Export(
+		ctx,
+		archiveFile,
+		archive.WithImage(client.ImageService(), image.Name())); err != nil {
+		return nil, err
+	}
+
+	return archiveFile, nil
+}
+
+func restore(ctx context.Context, archiveFile *os.File) (containerd.Container, <-chan containerd.ExitStatus, error) {
+	// seek to beginning of file in preparation for Import()
+	if _, err := archiveFile.Seek(0, 0); err != nil {
+		return nil, nil, err
+	}
+
+	images, err := client.Import(
+		ctx,
+		archiveFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Printf("imported images from %s", archiveFile.Name())
+
+	img, err := client.GetImage(ctx, images[0].Name)
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Printf("found image archive %s", img.Name())
+
+	restored, err := client.Restore(ctx, "restored-nginx", img,
+		containerd.WithRestoreImage,
+		containerd.WithRestoreSpec,
+		containerd.WithRestoreRuntime)
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Printf("started container %s", restored.ID())
+
+	task, err := restored.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	wait, err := task.Wait(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	log.Printf("starting container task %s", task.ID())
+	if err := task.Start(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	return restored, wait, nil
 }
 
 func cleanup(ctx context.Context, client *containerd.Client) error {
@@ -177,15 +260,6 @@ func remove(ctx context.Context, client *containerd.Client, container containerd
 		details += fmt.Sprintf(" (code:%d, time:%s, err:%v)", code, time, err)
 	}
 	log.Print(details)
-
-	containerInfo, err := container.Info(ctx)
-	if err != nil {
-		return err
-	}
-	if err := containerd.WithSnapshotCleanup(ctx, client, containerInfo); err != nil {
-		return err
-	}
-	log.Printf("container (%s): msg:'snapshot deleted'", container.ID())
 
 	if err := container.Delete(ctx); err != nil {
 		return err
